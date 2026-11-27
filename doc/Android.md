@@ -149,19 +149,81 @@ TBB 已经**静态链入** `libbasalt.so`，不需要单独发 `libtbb.so`。
 
 ## 六、部署到 Unity 项目
 
+### 6.1 为什么要 strip
+
+`strip` 作用是把 `.so` 里的 debug symbols 剥掉：
+
+| | 大小 | 作用 | 运行行为 |
+|---|---|---|---|
+| **未 strip** | 241 MB | 含函数名、变量名、行号、源文件路径 | 相同 |
+| **stripped** | 2.7 MB | 只保留必需的动态符号表（`vit_tracker_*` 等导出接口） | 相同 |
+
+Unity 两种都能用（`dlopen` / JNI 不关心 debug info），**区别只在 APK 体积**。生产 APK 不 strip 会膨胀 240MB+。
+
+### 6.2 推荐做法：Unity 放 stripped，PC 留未 strip
+
+这样既有小 APK，又能 debug 崩溃行号。
+
 ```bash
 STRIP=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/aarch64-linux-android/bin/strip
 UNITY_LIBS=/path/to/UnityProject/Assets/Plugins/Android/libs/arm64-v8a
 
-# 1. strip basalt 本体
+# 1. strip basalt 本体，部署到 Unity
 $STRIP -o $UNITY_LIBS/libbasalt.so build-android-arm64-v8a/libbasalt.so
 
 # 2. 一起拷依赖的 .so
 cp $OPENCV_ANDROID_SDK/sdk/native/libs/arm64-v8a/libopencv_java4.so $UNITY_LIBS/
 cp $ANDROID_NDK/sources/cxx-stl/llvm-libc++/libs/arm64-v8a/libc++_shared.so $UNITY_LIBS/
+
+# 3. 未 strip 的原件保留在电脑上（不要覆盖！）
+# build-android-arm64-v8a/libbasalt.so 就是未 strip 版本，debug 用
 ```
 
-**注意**：Unity 项目里放的 `.so` 的 ABI 必须和 Build Setting 里勾的 ABI 一致，不匹配会直接 crash。
+### 6.3 崩溃时用 addr2line 还原行号
+
+设备上跑 APK 崩溃 → `adb logcat` 抓到类似：
+
+```
+A/libc: Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0 in tid 12345
+A/DEBUG: pc 00000000000abc12  /data/app/.../libbasalt.so (BuildId: 5dd4e323e7...)
+```
+
+记下 `pc 0x0abc12`，在电脑上用**未 strip 的那份 .so**：
+
+```bash
+NDK=/home/yuancaimaiyi/xreal_metaloc/posidon/thirdparty/ndk/20.0.5594570
+ADDR2LINE=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-addr2line
+
+$ADDR2LINE -e build-android-arm64-v8a/libbasalt.so -f -C 0x0abc12
+# 输出类似:
+# basalt::vit_implementation::Tracker::Implementation::push_frame(...)
+# /home/yuancaimaiyi/basalt/src/vit/vit_tracker.cpp:432
+```
+
+**关键前提**：`BuildId` 必须和设备上 crash 的 `.so` 完全一致。所以每次重新编译后：
+1. 立刻备份当前 `build-android-arm64-v8a/libbasalt.so`（例如 `cp libbasalt.so libbasalt_$(date +%F_%H%M).so`）
+2. 对应的 stripped 版部署到 Unity
+3. 这两个一定要**配对**保存，别混淆不同 build 的版本——`BuildId` 对不上，行号就是乱的
+
+多个 `.so` 批量查地址：
+```bash
+$ADDR2LINE -e build-android-arm64-v8a/libbasalt.so -f -C 0xaddr1 0xaddr2 0xaddr3
+```
+
+### 6.4 ABI 必须完全对应
+
+Unity 打 APK 时，**Player Settings → Android → Target Architectures** 勾哪些 ABI，就从 `Assets/Plugins/Android/libs/<ABI>/` 对应目录打包 `.so`。两种常见错配：
+
+- **Unity 勾 arm64，但 .so 放到了 `armeabi-v7a/`** → APK 里根本没有这个 .so → `UnsatisfiedLinkError`，闪退
+- **.so 本身 32 位，但进程 64 位（arm64）** → `dlopen` 返回 null → 同样 crash
+
+AR 眼镜/现代手机一律只用 `arm64-v8a`。确保：
+
+```
+Unity 勾 arm64-v8a  →  .so 放 Assets/Plugins/Android/libs/arm64-v8a/libbasalt.so
+```
+
+`file libbasalt.so` 看到 `ARM aarch64` 才是 arm64。
 
 ---
 
