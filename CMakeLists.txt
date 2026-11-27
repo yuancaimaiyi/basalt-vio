@@ -97,7 +97,9 @@ if(NOT CXX_MARCH)
   set(CXX_MARCH native)
 endif()
 
-if(NOT APPLE OR NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+if(ANDROID)
+  message(STATUS "Running on Android (${CMAKE_SYSTEM_PROCESSOR}). Letting NDK toolchain pick arch flags; disabled -march.")
+elseif(NOT APPLE OR NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
   set(BASALT_MARCH_FLAGS "-march=${CXX_MARCH}")
 else()
   message(STATUS "Running on Apple ${CMAKE_SYSTEM_PROCESSOR}. Disabled -march flag.")
@@ -201,8 +203,10 @@ if(APPLE)
   endif()
 
 elseif(UNIX)
-  # assume libstdc++
-  set(STD_CXX_FS stdc++fs)
+  # assume libstdc++; Android's NDK libc++ has std::filesystem built in, no extra link needed
+  if(NOT ANDROID)
+    set(STD_CXX_FS stdc++fs)
+  endif()
 
   if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     message(STATUS "Detected Linux with clang.")
@@ -274,23 +278,70 @@ if(NOT EIGEN3_INCLUDE_DIR MATCHES "^${EIGEN_ROOT}")
   message(WARNING "Found Eigen headers are outside of specified EIGEN_ROOT '${EIGEN_ROOT}'")
 endif()
 
-if(WIN32)
+if(ANDROID)
+  # Patch vendored Eigen's FindStandardMathLibrary.cmake: it clears CMAKE_REQUIRED_FLAGS
+  # which makes the NDK libc++ <cmath> probe fail (defaults to C++98). This runs at
+  # configure time and is idempotent — rerunning cmake won't re-patch an already-patched
+  # file, so the submodule stays clean from git's perspective between builds.
+  set(_eigen_findmath "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/basalt-headers/thirdparty/eigen/cmake/FindStandardMathLibrary.cmake")
+  if(EXISTS "${_eigen_findmath}")
+    file(READ "${_eigen_findmath}" _contents)
+    if(_contents MATCHES "set\\(CMAKE_REQUIRED_FLAGS \"\"\\)")
+      string(REPLACE
+        "set(CMAKE_REQUIRED_FLAGS \"\")"
+        "set(CMAKE_REQUIRED_FLAGS \"-std=c++14\") # ANDROID patch: preserve C++14 std flag"
+        _contents "${_contents}")
+      file(WRITE "${_eigen_findmath}" "${_contents}")
+      message(STATUS "ANDROID: patched Eigen FindStandardMathLibrary.cmake")
+    endif()
+  endif()
+
+  # Build oneTBB from source (submodule). NDK has no system TBB; OpenCV
+  # Android SDK ships a bundled libtbb.a but no headers, so we can't link to it.
+  set(TBB_TEST OFF CACHE BOOL "" FORCE)
+  set(TBB_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(TBB_STRICT OFF CACHE BOOL "" FORCE)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  add_subdirectory(thirdparty/oneTBB EXCLUDE_FROM_ALL)
+  add_library(TBB::tbb ALIAS tbb)
+elseif(WIN32)
   find_package(TBB CONFIG REQUIRED)
 else()
   find_package(TBB REQUIRED)
 endif()
 
-message(
-  STATUS
-    "Found TBB ${TBB_VERSION_MAJOR}.${TBB_VERSION_MINOR} (interface version ${TBB_INTERFACE_VERSION}) headers in: ${TBB_INCLUDE_DIRS}"
-)
-if(TBB_INTERFACE_VERSION LESS 11004)
-  # enable global_control header for earlier TBB versions (Ubuntu 16.04, 18.04)
-  add_definitions(-DTBB_PREVIEW_GLOBAL_CONTROL)
+if(NOT ANDROID)
+  message(
+    STATUS
+      "Found TBB ${TBB_VERSION_MAJOR}.${TBB_VERSION_MINOR} (interface version ${TBB_INTERFACE_VERSION}) headers in: ${TBB_INCLUDE_DIRS}"
+  )
+  if(TBB_INTERFACE_VERSION LESS 11004)
+    # enable global_control header for earlier TBB versions (Ubuntu 16.04, 18.04)
+    add_definitions(-DTBB_PREVIEW_GLOBAL_CONTROL)
+  endif()
 endif()
 
 # NOTE: not specifying version, since 2, 3 or 4 is fine
-find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d highgui)
+if(ANDROID)
+  # OpenCV-android-sdk's OpenCVModules.cmake uses a strict export-set check that
+  # collides with our oneTBB-provided "tbb" target. Wire OpenCV manually from
+  # the SDK's layout instead of calling find_package().
+  if(NOT OpenCV_DIR)
+    message(FATAL_ERROR "ANDROID build requires -DOpenCV_DIR=<path to OpenCV-android-sdk>/sdk/native/jni")
+  endif()
+  set(_opencv_sdk_root "${OpenCV_DIR}/../..")
+  get_filename_component(_opencv_sdk_root "${_opencv_sdk_root}" ABSOLUTE)
+  set(OpenCV_INCLUDE_DIRS "${OpenCV_DIR}/include")
+  set(_opencv_lib_dir "${_opencv_sdk_root}/native/libs/${ANDROID_ABI}")
+  if(NOT EXISTS "${_opencv_lib_dir}/libopencv_java4.so")
+    message(FATAL_ERROR "OpenCV libs not found under ${_opencv_lib_dir}")
+  endif()
+  # libopencv_java4.so is a fat shared library containing core/imgproc/calib3d/highgui.
+  set(OpenCV_LIBS "${_opencv_lib_dir}/libopencv_java4.so")
+  set(OpenCV_VERSION "android-sdk")
+else()
+  find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d highgui)
+endif()
 message(STATUS "Found OpenCV ${OpenCV_VERSION} headers in: ${OpenCV_INCLUDE_DIRS}")
 message(STATUS "Found OpenCV_LIBS: ${OpenCV_LIBS}")
 
@@ -299,8 +350,16 @@ add_library(basalt::opencv INTERFACE IMPORTED)
 set_property(TARGET basalt::opencv PROPERTY INTERFACE_INCLUDE_DIRECTORIES ${OpenCV_INCLUDE_DIRS})
 set_property(TARGET basalt::opencv PROPERTY INTERFACE_LINK_LIBRARIES ${OpenCV_LIBS})
 
-find_package(fmt REQUIRED)
-message(STATUS "Found {fmt} ${fmt_VERSION} in: ${fmt_DIR}")
+if(ANDROID)
+  # Build fmt from source (submodule); NDK has no system fmt.
+  set(FMT_INSTALL OFF CACHE BOOL "" FORCE)
+  set(FMT_TEST OFF CACHE BOOL "" FORCE)
+  set(FMT_DOC OFF CACHE BOOL "" FORCE)
+  add_subdirectory(thirdparty/fmt EXCLUDE_FROM_ALL)
+else()
+  find_package(fmt REQUIRED)
+  message(STATUS "Found {fmt} ${fmt_VERSION} in: ${fmt_DIR}")
+endif()
 
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5) # TODO: Patch for opengv, sophus, ros
 add_subdirectory(thirdparty)
@@ -316,6 +375,10 @@ add_library(basalt::cli11 INTERFACE IMPORTED)
 set_property(
   TARGET basalt::cli11 PROPERTY INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/CLI11/include
 )
+if(ANDROID)
+  # NDK's std::filesystem support varies; disable CLI11's use of it on Android.
+  set_property(TARGET basalt::cli11 PROPERTY INTERFACE_COMPILE_DEFINITIONS CLI11_HAS_FILESYSTEM=0)
+endif()
 
 # custom scoped magic_enum target
 add_library(basalt::magic_enum INTERFACE IMPORTED)
@@ -331,7 +394,7 @@ configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/utils/build_config.h.in
   ${CMAKE_CURRENT_BINARY_DIR}/include/basalt/utils/build_config.h
 )
-target_include_directories(basalt_internal PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/include)
+target_include_directories(basalt_internal PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/include)
 
 # List all header and source files with target_sources.
 # This ensures, e.g., that QtCreator >= 6.0 properly recognize these headers to belong to the project.
@@ -375,7 +438,6 @@ target_sources(
          ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/utils/union_find.h
          ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/utils/vio_config.h
          ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/utils/vis_matrices.h
-         ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/utils/vis_utils.h
          ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/vi_estimator/ba_base.h
          ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/vi_estimator/landmark_database.h
          ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/vi_estimator/marg_helper.h
@@ -384,8 +446,7 @@ target_sources(
          ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/vi_estimator/sqrt_keypoint_vio.h
          ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/vi_estimator/sqrt_keypoint_vo.h
          ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/vi_estimator/vio_estimator.h
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/io/marg_data_io.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/src/linearization/landmark_block.cpp
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/linearization/landmark_block.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/src/linearization/linearization_abs_qr.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/src/linearization/linearization_abs_sc.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/src/linearization/linearization_base.cpp
@@ -395,7 +456,6 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/system_utils.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/time_utils.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/vio_config.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/vis_utils.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/src/vi_estimator/ba_base.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/src/vi_estimator/landmark_database.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/src/vi_estimator/marg_helper.cpp
@@ -412,12 +472,14 @@ target_link_libraries(
          basalt::opencv
          basalt::basalt-headers
          TBB::tbb
-         pangolin
          basalt::cli11
          basalt::vit
          basalt::magic_enum
   PRIVATE nlohmann::json fmt::fmt
 )
+if(NOT BASALT_BUILD_SHARED_LIBRARY_ONLY)
+  target_link_libraries(basalt_internal PUBLIC pangolin)
+endif()
 target_include_directories(basalt_internal PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_definitions(basalt_internal PUBLIC ${BASALT_COMPILE_DEFINITIONS})
 #target_compile_definitions(basalt_internal PUBLIC BASALT_DISABLE_ASSERTS)
@@ -437,11 +499,14 @@ if(NOT BASALT_BUILD_SHARED_LIBRARY_ONLY)
            ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/io/dataset_io_rosbag.h
            ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/io/dataset_io_uzh.h
            ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/io/marg_data_io.h
+           ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/utils/vis_utils.h
            ${CMAKE_CURRENT_SOURCE_DIR}/include/basalt/vi_estimator/nfr_mapper.h
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/calibration/aprilgrid.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/src/calibration/calibraiton_helper.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/src/calibration/vignette.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/src/io/dataset_io.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/io/marg_data_io.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/vis_utils.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/src/vi_estimator/nfr_mapper.cpp
   )
   target_link_libraries(basalt_internal PRIVATE rosbag apriltag opengv)

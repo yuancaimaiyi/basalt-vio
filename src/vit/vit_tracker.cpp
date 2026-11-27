@@ -38,7 +38,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 @author Simon Zeni <simon.zeni@collabora.com>
 */
 
+#include <basalt/utils/build_config.h>
+#ifndef BASALT_BUILD_SHARED_LIBRARY_ONLY
 #include <basalt/io/marg_data_io.h>
+#endif
 #include <basalt/optical_flow/optical_flow.h>
 #include <basalt/serialization/headers_serialization.h>
 #include <basalt/utils/vio_config.h>
@@ -46,7 +49,22 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <basalt/calibration/calibration.hpp>
 #include <basalt/vit/vit_tracker.hpp>
 #include <vit_implementation_helper.hpp>
+#ifndef BASALT_BUILD_SHARED_LIBRARY_ONLY
 #include "vit_tracker_ui.hpp"
+#else
+#include <cstdio>
+#include <cstdlib>
+#define ASSERT(cond, ...)                                      \
+  do {                                                         \
+    if (!(cond)) {                                             \
+      printf("Assertion failed @%s:%d\n", __func__, __LINE__); \
+      printf(__VA_ARGS__);                                     \
+      printf("\n");                                            \
+      exit(EXIT_FAILURE);                                      \
+    }                                                          \
+  } while (false);
+#define ASSERT_(cond) ASSERT(cond, "%s", #cond);
+#endif
 
 #include <tbb/concurrent_queue.h>
 #include <tbb/global_control.h>
@@ -149,8 +167,10 @@ struct Tracker::Implementation {
   thread queues_printer_thread;
 
   // External Queues
+#ifndef BASALT_BUILD_SHARED_LIBRARY_ONLY
   vit_tracker_ui ui{};
   MargDataSaver::Ptr marg_data_saver;
+#endif
   // Additional calibration data
   vector<vit::CameraCalibration> added_cam_calibs{};
   vector<vit::ImuCalibration> added_imu_calibs{};
@@ -397,26 +417,32 @@ struct Tracker::Implementation {
 
     opt_flow_ptr->output_queue = &vio->vision_data_queue;
     opt_flow_ptr->show_gui = show_gui;
+#ifndef BASALT_BUILD_SHARED_LIBRARY_ONLY
     if (show_gui) {
       ui.initialize(cam_count);
       vio->out_vis_queue = &ui.out_vis_queue;
     };
+#endif
     vio->out_state_queue = &out_state_queue;
     vio->opt_flow_depth_guess_queue = &opt_flow_ptr->input_depth_queue;
     vio->opt_flow_state_queue = &opt_flow_ptr->input_state_queue;
     vio->opt_flow_lm_bundle_queue = &opt_flow_ptr->input_lm_bundle_queue;
 
+#ifndef BASALT_BUILD_SHARED_LIBRARY_ONLY
     if (!marg_data_path.empty()) {
       marg_data_saver = make_shared<MargDataSaver>(marg_data_path);
       vio->out_marg_queue = &marg_data_saver->in_marg_queue;
     }
+#endif
   }
 
   void start() {
     running = true;
     vio->initialize(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
 
+#ifndef BASALT_BUILD_SHARED_LIBRARY_ONLY
     if (show_gui) ui.start(vio->getT_w_i_init(), calib, vio_config, opt_flow_ptr, vio);
+#endif
     if (!deterministic) state_consumer_thread = thread(&Tracker::Implementation::state_consumer, this);
     if (print_queue) queues_printer_thread = thread(&Tracker::Implementation::queues_printer, this);
   }
@@ -429,7 +455,9 @@ struct Tracker::Implementation {
 
     if (print_queue) queues_printer_thread.join();
     if (!deterministic) state_consumer_thread.join();
+#ifndef BASALT_BUILD_SHARED_LIBRARY_ONLY
     if (show_gui) ui.stop();
+#endif
 
     // TODO: There is a segfault when closing monado without starting the stream
     // happens in a lambda from keypoint_vio.cpp and ends at line c1alib_bias.hpp:112
@@ -462,7 +490,9 @@ struct Tracker::Implementation {
 
     if (i == 0) {
       partial_frame = make_shared<OpticalFlowInput>(cam_count);
+#ifndef BASALT_BUILD_SHARED_LIBRARY_ONLY
       partial_frame->show_uimat = ui.get_mat_to_show();
+#endif
 
       partial_frame->t_ns = s->timestamp;
 
@@ -505,7 +535,9 @@ struct Tracker::Implementation {
       partial_frame->addTime("frames_read");
       partial_frame->addTime("frames_pushed");
       image_data_queue->push(partial_frame);
+#ifndef BASALT_BUILD_SHARED_LIBRARY_ONLY
       if (show_gui) ui.update_last_image(partial_frame);
+#endif
       if (deterministic) pop_state();
     }
   }
@@ -558,7 +590,9 @@ struct Tracker::Implementation {
     }
     data->input_images->addTime("consumer_state_received");
 
+#ifndef BASALT_BUILD_SHARED_LIBRARY_ONLY
     if (show_gui) ui.log_vio_data(data);
+#endif
 
     data->input_images->addTime("consumer_state_pushed");
     while (!monado_out_state_queue.try_push(data)) monado_out_state_queue.pop(_);

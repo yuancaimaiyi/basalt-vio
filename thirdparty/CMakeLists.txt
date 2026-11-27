@@ -3,7 +3,28 @@ cmake_minimum_required(VERSION 3.10...3.18)
 add_library(nlohmann::json INTERFACE IMPORTED GLOBAL)
 set_property(TARGET nlohmann::json PROPERTY INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/json/)
 
+if(ANDROID)
+  # basalt-headers' perf comparison / sandbox pull in host-only tooling
+  set(SKIP_PERFORMANCE_COMPARISON ON CACHE BOOL "" FORCE)
+  set(BUILD_SANDBOX OFF CACHE BOOL "" FORCE)
+  # Eigen's blas/ and lapack/ subdirs call enable_language(Fortran) at configure
+  # time (via project()). The NDK has no Fortran compiler. Skip those subdirs by
+  # intercepting add_subdirectory for the duration of basalt-headers' include.
+  macro(add_subdirectory _dir)
+    if("${_dir}" STREQUAL "blas" OR "${_dir}" STREQUAL "lapack")
+      message(STATUS "ANDROID: skipping eigen subdirectory '${_dir}'")
+    else()
+      _add_subdirectory(${_dir} ${ARGN})
+    endif()
+  endmacro()
+endif()
 add_subdirectory(basalt-headers EXCLUDE_FROM_ALL)
+if(ANDROID)
+  # Restore default add_subdirectory for the remainder of this file.
+  macro(add_subdirectory)
+    _add_subdirectory(${ARGN})
+  endmacro()
+endif()
 
 if(NOT BASALT_BUILD_SHARED_LIBRARY_ONLY)
   add_subdirectory(ros EXCLUDE_FROM_ALL)
@@ -32,40 +53,43 @@ set(BUILD_PANGOLIN_FFMPEG OFF CACHE BOOL "Build support for ffmpeg video input")
 set(EIGEN_INCLUDE_DIR "${EIGEN3_INCLUDE_DIR}")
 set(EIGEN_INCLUDE_DIRS "${EIGEN3_INCLUDE_DIR}")
 
-# Hack to disable march=native in opengv
-macro(add_definitions)
-  if(NOT ${ARGV0} STREQUAL "-march=native")
-    _add_definitions(${ARGN})
-  endif()
-endmacro()
-add_subdirectory(opengv EXCLUDE_FROM_ALL)
+# opengv + Pangolin are only needed for host tools (calibration, UI, mapper). Skip on Android / library-only builds.
+if(NOT BASALT_BUILD_SHARED_LIBRARY_ONLY)
+  # Hack to disable march=native in opengv
+  macro(add_definitions)
+    if(NOT ${ARGV0} STREQUAL "-march=native")
+      _add_definitions(${ARGN})
+    endif()
+  endmacro()
+  add_subdirectory(opengv EXCLUDE_FROM_ALL)
 
-# fix opengv: c++17 and debug postfix
-set_target_properties(opengv PROPERTIES CXX_STANDARD 17 DEBUG_POSTFIX "")
+  # fix opengv: c++17 and debug postfix
+  set_target_properties(opengv PROPERTIES CXX_STANDARD 17 DEBUG_POSTFIX "")
 
-# fix opengv: compile options (CMAKE_CXX_FLAGS is overwritten by Opengv)
-target_compile_options(opengv PRIVATE ${BASALT_MARCH_FLAGS} "SHELL:${BASALT_PASSED_CXX_FLAGS}")
-ignore_external_warnings(opengv)
+  # fix opengv: compile options (CMAKE_CXX_FLAGS is overwritten by Opengv)
+  target_compile_options(opengv PRIVATE ${BASALT_MARCH_FLAGS} "SHELL:${BASALT_PASSED_CXX_FLAGS}")
+  ignore_external_warnings(opengv)
 
-# Hack to disable CPack in Pangolin.
-macro(include)
-  if(NOT ${ARGV0} STREQUAL "CPack")
-    _include(${ARGN})
-  endif()
-endmacro()
+  # Hack to disable CPack in Pangolin.
+  macro(include)
+    if(NOT ${ARGV0} STREQUAL "CPack")
+      _include(${ARGN})
+    endif()
+  endmacro()
 
-# Add pangolin and create an INTERFACE SYSTEM library out of it
-# TODO: For cmake 3.25, use the SYSTEM parameter of add_subidrectory to avoid adding SYSTEM and silencing warnings explicitly
-add_subdirectory(Pangolin EXCLUDE_FROM_ALL)
+  # Add pangolin and create an INTERFACE SYSTEM library out of it
+  # TODO: For cmake 3.25, use the SYSTEM parameter of add_subidrectory to avoid adding SYSTEM and silencing warnings explicitly
+  add_subdirectory(Pangolin EXCLUDE_FROM_ALL)
 
-get_property(pangolin_targets DIRECTORY Pangolin PROPERTY BUILDSYSTEM_TARGETS)
-foreach(_target ${pangolin_targets})
-  ignore_external_warnings(${_target})
-endforeach()
+  get_property(pangolin_targets DIRECTORY Pangolin PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(_target ${pangolin_targets})
+    ignore_external_warnings(${_target})
+  endforeach()
 
-add_library(pangolin INTERFACE)
-target_link_libraries(pangolin INTERFACE ${pangolin_targets})
-target_include_directories(pangolin SYSTEM INTERFACE ${pangolin_targets})
+  add_library(pangolin INTERFACE)
+  target_link_libraries(pangolin INTERFACE ${pangolin_targets})
+  target_include_directories(pangolin SYSTEM INTERFACE ${pangolin_targets})
+endif()
 
 # TODO: enable once mpark issue is fixed upstream pangolin
 #set_target_properties(pangolin PROPERTIES
@@ -73,23 +97,25 @@ target_include_directories(pangolin SYSTEM INTERFACE ${pangolin_targets})
 
 # check here the directories for the pangolin and opengv targets, and
 # confirm that the eigen-related include dirs match.
-foreach(_target opengv pangolin)
-  get_target_property(_include_dirs ${_target} INTERFACE_INCLUDE_DIRECTORIES)
-  foreach(_dir IN LISTS _include_dirs)
-    if("${_dir}" MATCHES ".*/eigen3?(/unsupported)?$")
-      if(NOT _dir MATCHES "^${EIGEN3_INCLUDE_DIR}.*")
+if(NOT BASALT_BUILD_SHARED_LIBRARY_ONLY)
+  foreach(_target opengv pangolin)
+    get_target_property(_include_dirs ${_target} INTERFACE_INCLUDE_DIRECTORIES)
+    foreach(_dir IN LISTS _include_dirs)
+      if("${_dir}" MATCHES ".*/eigen3?(/unsupported)?$")
+        if(NOT _dir MATCHES "^${EIGEN3_INCLUDE_DIR}.*")
 
+        endif()
       endif()
-    endif()
+    endforeach()
   endforeach()
-endforeach()
+endif()
 
 # opengv and pangolin assume that eigen is found outside the source
 # directory and thus include it in INTERFACE_INCLUDE_DIRECTORIES,
 # which makes cmake complain that that property contains paths in the
 # source folder. Thus, we update the property to only include these
 # eigen paths in the "BUILD_INTERFACE" (not "INSTALL").
-if(EIGEN3_INCLUDE_DIR MATCHES "^${CMAKE_SOURCE_DIR}.*")
+if(NOT BASALT_BUILD_SHARED_LIBRARY_ONLY AND EIGEN3_INCLUDE_DIR MATCHES "^${CMAKE_SOURCE_DIR}.*")
   foreach(_target opengv pangolin)
     get_target_property(_include_dirs ${_target} INTERFACE_INCLUDE_DIRECTORIES)
     set(_include_dirs_new "")
